@@ -1,0 +1,202 @@
+#!/usr/bin/env python
+import os, re, subprocess
+from make import Makefile, Rule
+
+name = "frt"
+
+config_header = "include/frt/config.h"
+
+headers = (
+    "include/frt/math.h",
+    "include/frt/os.h",
+    "include/frt/os_posix.inl",
+)
+
+sources = (
+    "src/os_posix.c",
+)
+
+m = Makefile()
+
+m.macros = {
+    "PREFIX":   "/usr/local",
+    "ARFLAGS":  "-cru",
+    "CPPFLAGS": "-DNDEBUG -D_XOPEN_SOURCE=500",
+    "CFLAGS":   "-g -O3 -mtune=native -Wall -Wconversion -pedantic -std=c99",
+}
+
+m.phonys = {
+    "all": Rule((
+        "dist/lib/lib{0}.a".format(name),
+    )),
+    "clean": Rule((), (
+        "rm -fr dist",
+    )),
+    "doc": Rule((), (
+        ". tools/conf && doc_init dist/share/doc/" + name,
+        "doxygen",
+    )),
+    "doc-upload": Rule(("doc",), (
+        ". tools/conf && doc_upload dist/share/doc/" + name,
+    )),
+}
+
+# ----------------------------------------------------------------------------
+
+shell_keywords = ("case", "do", "done", "elif", "else", "esac", "fi", "for",
+                  "function", "if", "in", "select", "then", "until", "while")
+
+def quote(s):
+    if re.match("[a-zA-Z0-9./_-]*$", s) and s not in shell_keywords:
+        return s
+    return "'{0}'".format(s.replace("'", "'\''"))
+
+def dist(s):
+    return os.path.join("dist", s)
+
+def atformat(s, *args, **kwargs):
+    return re.sub("@([0-9]+)", "{\\1}", s
+                  .replace("{", "{{")
+                  .replace("}", "}}")).format(*args, **kwargs)
+
+def add_rule(target, prereqs, commands_func, install=None):
+    commands = []
+    dist_target = dist(target)
+    target_dir = os.path.dirname(dist_target)
+    prereqs = tuple(prereqs)
+    for prereq in prereqs:
+        if (os.path.dirname(prereq) + "/").startswith(target_dir + "/"):
+            break
+    else:
+        commands.append("mkdir -p {0}".format(quote(os.path.dirname(dist_target))))
+    commands.extend(commands_func(dist_target))
+    m.rules[dist_target] = Rule(prereqs, commands)
+    if install is not None:
+        install_file(target, install)
+
+install_dirs = set()
+install_files = {}
+def install_file(fn, file_type=""):
+    if file_type == "s":
+        command = "cp -P"
+    elif file_type == "x":
+        command = "install -m755"
+    else:
+        command = "install -m644"
+    install_dir = os.path.dirname(fn)
+    install_type = (command, install_dir)
+    to_be_removed = set()
+    for other_install_dir in install_dirs:
+        if (install_dir + "/").startswith(other_install_dir + "/"):
+            to_be_removed.add(other_install_dir)
+        elif (other_install_dir + "/").startswith(install_dir + "/"):
+            break
+    else:
+        install_dirs.difference_update(to_be_removed)
+        install_dirs.add(install_dir)
+    if install_type in install_files:
+        install_files[install_type].append(fn)
+    else:
+        install_files[install_type] = [fn]
+
+objectfiles = tuple(os.path.join("tmp", source + ".o")
+                    for source in sources)
+
+# static library
+add_rule(
+    "lib/lib{0}.a".format(name),
+    map(dist, objectfiles),
+    lambda target:
+    ("$(AR) $(ARFLAGS) {0} {1}"
+     .format(quote(target), " ".join(map(quote, map(dist, objectfiles)))),),
+    install=""
+)
+
+# config header
+add_rule(
+    config_header,
+    (config_header, "tools/conf"),
+    lambda target: (x.replace("\n", " && ") for x in atformat("""
+
+head >@0.tmp -n 2 @1
+
+. tools/conf
+cc() { $(CC) $(CPPFLAGS) $(CFLAGS) "$$@"; }
+detect_limits >>@0.tmp signed off_t RF_OFF sys/types.h
+
+tail >>@0.tmp -n +3 @1
+
+mv -f @0.tmp @0
+
+""", quote(target), quote(config_header)).strip().split("\n\n")),
+    install=""
+)
+
+# other headers
+for header in headers:
+    add_rule(
+        header,
+        (header,),
+        lambda target:
+        ("cp -f {0} {1}"
+         .format(quote(header), quote(target)),),
+        install=""
+    )
+
+# source code -> object file
+for source, objectfile in zip(sources, objectfiles):
+
+    # determine the appropriate compiler
+    dist_include = quote(dist("include"))
+    _, extension = os.path.splitext(os.path.normcase(source))
+    if extension == ".c":
+        compiler = "$(CC) $(CPPFLAGS) -I{0} $(CFLAGS)".format(dist_include)
+        linker   = "$(CC)"
+    elif extension in (".C", ".c++", ".cc", ".cpp", ".cxx"):
+        compiler = "$(CXX) $(CPPFLAGS) -I{0} $(CXXFLAGS)".format(dist_include)
+        linker   = "$(CXX)"
+    else:
+        raise ValueError("unknown source language: " + source)
+
+    # obtain prerequisites with the help of the compiler
+    prereqs = tuple(
+        dist(prereq) if prereq in headers or prereq == config_header else prereq
+        for prereq in
+        re.sub(r"\s\\\s", " ", subprocess.check_output(
+            "cpp {0} -MM {1}".format(
+                m.macros["CPPFLAGS"] + " -Iinclude",
+                source
+            ),
+            shell=True,
+        ).decode("utf-8")).split(":", 1)[1].split()
+    )
+
+    add_rule(
+        objectfile,
+        prereqs,
+        lambda target:
+        ("{0} -o {1} -c {2}"
+         .format(compiler, quote(target), quote(source)),)
+    )
+
+# install and uninstall
+if len(install_files):
+    m.phonys["install"] = Rule(
+        ("all",),
+        ("mkdir -p " + " ".join("$(DESTDIR)$(PREFIX)/" + quote(x)
+                                for x in sorted(install_dirs)),) +
+        tuple("{0} {1} $(DESTDIR)$(PREFIX)/{2}"
+              .format(command,
+                      " ".join(map(quote, map(dist, fns))),
+                      quote(install_dir))
+              for (command, install_dir), fns
+              in sorted(install_files.items()))
+    )
+    m.phonys["uninstall"] = Rule((), (
+        "rm -f" + "".join(
+            "".join(" $(DESTDIR)$(PREFIX)/" + quote(fn) for fn in fns)
+            for fns in sorted(install_files.values())
+        ),
+    ))
+
+m.to_file("Makefile")
